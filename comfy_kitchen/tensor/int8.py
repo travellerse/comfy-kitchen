@@ -12,6 +12,7 @@ import logging
 from dataclasses import dataclass
 
 import torch
+from torch._subclasses.fake_tensor import is_fake
 
 from comfy_kitchen.registry import registry
 
@@ -245,6 +246,46 @@ class TensorWiseINT8Layout(QuantizedLayout):
 # =============================================================================
 
 
+def _dispatch_int8_linear(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    bias: torch.Tensor | None,
+    out_dtype: torch.dtype,
+    convrot: bool,
+    convrot_groupsize: int,
+) -> torch.Tensor:
+    """Dispatch directly in eager mode while preserving the custom op for tracing."""
+    # torch.compiler.is_compiling only exists on newer PyTorch; older versions
+    # (or exotic builds without the module) must take the eager registry path.
+    is_compiling = getattr(
+        getattr(torch, "compiler", None), "is_compiling", lambda: False
+    )()
+    if is_compiling or is_fake(x):
+        return torch.ops.comfy_kitchen.int8_linear(
+            x,
+            weight,
+            weight_scale,
+            bias,
+            _dtype_code(out_dtype),
+            convrot,
+            convrot_groupsize,
+        )
+
+    call_kwargs = {
+        "x": x,
+        "weight": weight,
+        "weight_scale": weight_scale,
+        "bias": bias,
+        "out_dtype": out_dtype,
+        "convrot": convrot,
+        "convrot_groupsize": convrot_groupsize,
+        "input_act": None,
+    }
+    impl = registry.get_implementation("int8_linear", kwargs=call_kwargs)
+    return impl(**call_kwargs)
+
+
 @register_layout_op(torch.ops.aten.t.default, TensorWiseINT8Layout)
 def _handle_int8_transpose(qt, args, kwargs):
     """Handle transpose as a logical flag flip for INT8 tensors."""
@@ -284,12 +325,12 @@ def _handle_int8_linear_tensorwise(qt, args, kwargs):
     convrot = getattr(weight._params, "convrot", False)
     convrot_groupsize = getattr(weight._params, "convrot_groupsize", 256)
 
-    return torch.ops.comfy_kitchen.int8_linear(
+    return _dispatch_int8_linear(
         input_tensor.contiguous(),
         weight_qdata.contiguous(),
         weight_scale,
         bias,
-        _dtype_code(out_dtype),
+        out_dtype,
         convrot,
         convrot_groupsize,
     )
@@ -327,12 +368,12 @@ def _handle_int8_mm_tensorwise(qt, args, kwargs):
         # columns, so transposing qdata alone would apply the wrong scales.
         return torch.mm(*dequantize_args(args), **dequantize_args(kwargs))
 
-    return torch.ops.comfy_kitchen.int8_linear(
+    return _dispatch_int8_linear(
         input_tensor.contiguous(),
         int8_weight,
         weight_scale,
         None,
-        _dtype_code(out_dtype),
+        out_dtype,
         convrot,
         convrot_groupsize,
     )
@@ -364,12 +405,12 @@ def _handle_int8_addmm_tensorwise(qt, args, kwargs):
     else:
         return torch.addmm(*dequantize_args(args), **dequantize_args(kwargs))
 
-    return torch.ops.comfy_kitchen.int8_linear(
+    return _dispatch_int8_linear(
         input_tensor.contiguous(),
         int8_weight,
         weight_scale,
         bias,
-        _dtype_code(out_dtype),
+        out_dtype,
         convrot,
         convrot_groupsize,
     )
