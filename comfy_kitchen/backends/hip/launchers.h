@@ -27,6 +27,12 @@ void launch_int8_gemm_kernel(const void* a, const void* b, void* c, const void* 
                              int bias_code, int M, int N, int K, int ldc, int out_code,
                              hipStream_t stream);
 
+// RDNA2 DP4A GEMM (ops/gemm_dp4a.hip); see launch_int8_gemm_kernel for scale/bias layout.
+void launch_int8_gemm_dp4a_kernel(const void* a, const void* b, void* c, const void* scale_a,
+                                  const void* scale_b, int scale_b_stride, const void* bias,
+                                  int bias_code, int M, int N, int K, int out_code,
+                                  hipStream_t stream);
+
 // scale_code is a DTYPE_TO_CODE value: 0 float32, 5 e4m3 (passed as raw bytes).
 // codebook is 16 floats, or null for the uniform levels.
 void launch_dequant_int4_grouped_to_int8_kernel(const void* qw, const void* s_rel, int scale_code,

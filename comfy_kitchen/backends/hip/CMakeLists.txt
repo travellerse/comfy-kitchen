@@ -157,6 +157,7 @@ set(HIP_SOURCES
     ops/quantize_int8.hip
     ops/gemm_fp8.hip
     ops/gemm_int8.hip
+    ops/gemm_dp4a.hip
     ops/convrot_w4a4.hip
     ops/adaln.hip
     ops/na3d.hip
