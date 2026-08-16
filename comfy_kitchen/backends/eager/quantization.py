@@ -742,6 +742,17 @@ def _int8_mm_n_alignment(tensor: torch.Tensor) -> int:
     return 32 if tensor.is_cuda and _cuda_device_is_turing(tensor.get_device()) else 8
 
 
+def _rocm_device_is_gfx10(tensor: torch.Tensor) -> bool:
+    """Whether a CUDA-typed tensor is on a GFX10-family ROCm target."""
+    if not tensor.is_cuda or not getattr(torch.version, "hip", None):
+        return False
+    try:
+        arch = torch.cuda.get_device_properties(tensor.get_device()).gcnArchName
+    except (AttributeError, RuntimeError):
+        return False
+    return arch.split(":", 1)[0].startswith("gfx10")
+
+
 def _round_up(value: int, alignment: int) -> int:
     return ((value + alignment - 1) // alignment) * alignment
 
@@ -798,6 +809,46 @@ def mm_int8(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     assert a.dim() == 2 and b.dim() == 2
     assert a.size(1) == b.size(0), f"K mismatch: {a.size(1)} vs {b.size(0)}"
     return _int8_matmul_accumulate(a, b)
+
+
+def _int8_linear_float_gemm(
+    x_8: torch.Tensor,
+    weight: torch.Tensor,
+    x_scale: torch.Tensor,
+    weight_scale: torch.Tensor,
+    bias: torch.Tensor | None,
+    out_dtype: torch.dtype,
+) -> torch.Tensor:
+    """The exact INT8 linear contract computed with float GEMMs.
+
+    ``x_8`` and ``weight`` are the already-quantized operands and ``x_scale`` /
+    ``weight_scale`` their per-row / per-output-channel scales, so the math
+    matches the INT8 matmul path: ``(x_8 @ weight^T) * (x_scale * weight_scale)
+    + bias``. Only the GEMM execution differs (float instead of hipBLASLt INT8),
+    not the semantics: input_act and ConvRot rotation are applied before this
+    point, exactly as in the INT8 path.
+    """
+    m, k = x_8.shape
+    n = weight.shape[0]
+    result = torch.empty((m, n), device=x_8.device, dtype=out_dtype)
+    x_float = x_8.float()
+    x_scale_1d = x_scale.to(device=x_8.device, dtype=torch.float32).reshape(-1, 1)
+    bias_float = None if bias is None else bias.to(device=x_8.device, dtype=torch.float32)
+
+    # Bound each FP32 weight + accumulator pair to roughly 256 MiB.
+    bytes_per_output_channel = max(1, (k + m) * torch.float32.itemsize)
+    channel_chunk = max(1, min(n, 256 * 1024 * 1024 // bytes_per_output_channel))
+    for start in range(0, n, channel_chunk):
+        end = min(start + channel_chunk, n)
+        scale = weight_scale if weight_scale.numel() == 1 else weight_scale[start:end]
+        dequantized_weight = weight[start:end].float()
+        dequantized_weight.mul_(scale.reshape(-1, 1))
+        chunk = torch.nn.functional.linear(x_float, dequantized_weight)
+        chunk = chunk * x_scale_1d
+        if bias_float is not None:
+            chunk.add_(bias_float[start:end].reshape(1, -1))
+        result[:, start:end] = chunk.to(out_dtype)
+    return result
 
 
 def _int8_stochastic_rng(x: torch.Tensor, seed: int) -> torch.Tensor:
@@ -1022,6 +1073,15 @@ def int8_linear(
 
     # Quantize input per-row
     x_8, x_scale = quantize_int8_rowwise(x_2d)
+
+    # PyTorch's ROCm INT8 matmul enters hipBLASLt. Common ROCm wheels omit its
+    # gfx10 Tensile library, so the int8 matmul can fail asynchronously on the
+    # device. Fall back to a float GEMM on the same quantized operands; the
+    # activation, ConvRot rotation and quantization above are shared with the
+    # INT8 path, so only the GEMM execution changes.
+    if _rocm_device_is_gfx10(x_2d):
+        result = _int8_linear_float_gemm(x_8, weight, x_scale, weight_scale, bias, out_dtype)
+        return result.reshape(*orig_shape[:-1], weight.shape[0])
 
     # Compute: x_8 @ weight.T using fast int8 matmul when shape constraints allow it.
     # weight is [N, K], we need [K, N] for matmul so transpose

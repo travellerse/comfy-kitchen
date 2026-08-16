@@ -2,6 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for INT8 block-wise quantization."""
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
@@ -128,6 +130,161 @@ def test_eager_int8_matmul_turing_n_alignment(monkeypatch):
     assert quantization._int8_mm_n_alignment(tensor) == 32
     assert quantization._round_up(17, quantization._int8_mm_n_alignment(tensor)) == 32
     assert calls == [0]
+
+
+@pytest.mark.parametrize(
+    ("arch", "expected"),
+    [
+        ("gfx1030", True),
+        ("gfx1030:sramecc-:xnack-", True),
+        ("gfx1010", True),
+        ("gfx1100", False),
+    ],
+)
+def test_eager_detects_rocm_gfx10_devices(arch, expected, monkeypatch):
+    from comfy_kitchen.backends.eager import quantization
+
+    detector = getattr(quantization, "_rocm_device_is_gfx10", None)
+    assert detector is not None, "eager INT8 linear needs a gfx10 fallback detector"
+
+    class FakeCudaTensor:
+        is_cuda = True
+
+        def get_device(self):
+            return 2
+
+    monkeypatch.setattr(torch.version, "hip", "7.2")
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_properties",
+        lambda device_index: SimpleNamespace(gcnArchName=arch),
+    )
+
+    assert detector(FakeCudaTensor()) is expected
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available()
+    or not getattr(torch.version, "hip", None)
+    or not torch.cuda.get_device_properties(0).gcnArchName.startswith("gfx10"),
+    reason="ROCm gfx10 device required",
+)
+def test_eager_int8_linear_gfx10_avoids_hipblaslt(monkeypatch):
+    from comfy_kitchen.backends.eager import quantization
+
+    def reject_hipblaslt(*args, **kwargs):
+        raise AssertionError("gfx10 eager INT8 linear reached hipBLASLt")
+
+    monkeypatch.setattr(torch, "_int_mm", reject_hipblaslt)
+    if hasattr(torch, "int8_mm"):
+        monkeypatch.setattr(torch, "int8_mm", reject_hipblaslt)
+
+    x = torch.randn(9, 16, device="cuda", dtype=torch.bfloat16)
+    weight = torch.randint(-127, 128, (13, 16), device="cuda", dtype=torch.int8)
+    weight_scale = torch.rand(13, device="cuda", dtype=torch.float32)
+    bias = torch.randn(13, device="cuda", dtype=torch.bfloat16)
+
+    actual = quantization.int8_linear(x, weight, weight_scale, bias)
+
+    # Same contract as the INT8 path: activation quantization happens first, and
+    # only the GEMM execution moves to float. The reference below reproduces the
+    # exact math of the fallback, so the comparison is tight.
+    x_8, x_scale = quantization.quantize_int8_rowwise(x)
+    expected = torch.nn.functional.linear(
+        x_8.float(), weight.float() * weight_scale.reshape(-1, 1)
+    )
+    expected = expected * x_scale.reshape(-1, 1)
+    expected = (expected + bias.float()).to(torch.bfloat16)
+
+    torch.testing.assert_close(actual, expected, rtol=1e-3, atol=1e-3)
+
+
+def _gfx10_fallback_inputs(device):
+    """Fixed inputs for the gfx10 fallback contract, deterministic across backends."""
+    torch.manual_seed(0)
+    m, k, n = 9, 256, 13
+    x = torch.randn(m, k, device=device, dtype=torch.bfloat16) * 0.7
+    weight = torch.randint(-127, 128, (n, k), device=device, dtype=torch.int8)
+    weight_scale = torch.rand(n, device=device, dtype=torch.float32) * 0.02
+    bias = torch.randn(n, device=device, dtype=torch.bfloat16)
+    return x, weight, weight_scale, bias
+
+
+def _gfx10_fallback_contract_reference(quantization, x, weight, weight_scale, bias):
+    """The exact int8_linear contract assembled from the same eager helpers:
+    input_act -> rotation -> quantization -> float GEMM -> scale -> bias."""
+    acted = quantization._apply_input_act(x, "gelu_tanh")
+    h = quantization._build_hadamard(256, device=x.device, dtype=x.dtype)
+    rotated = quantization._rotate_activation(acted, h, 256)
+    x_8, x_scale = quantization.quantize_int8_rowwise(rotated)
+    expected = torch.nn.functional.linear(
+        x_8.float(), weight.float() * weight_scale.reshape(-1, 1)
+    )
+    expected = expected * x_scale.reshape(-1, 1)
+    expected = (expected + bias.float()).to(torch.bfloat16)
+    return expected
+
+
+def _assert_gfx10_fallback_contract(quantization, x, weight, weight_scale, bias):
+    """The gfx10 fallback replaces only the GEMM execution, never the pipeline.
+
+    Regression guard for the invariant that input_act, the ConvRot Hadamard
+    rotation and activation quantization all happen before the float GEMM. A
+    refactor that returns the fallback before those steps fails here, because
+    gelu_tanh and the rotation materially change the quantized activations.
+    """
+    actual = quantization.int8_linear(
+        x,
+        weight,
+        weight_scale,
+        bias,
+        input_act="gelu_tanh",
+        convrot=True,
+        convrot_groupsize=256,
+    )
+    expected = _gfx10_fallback_contract_reference(
+        quantization, x, weight, weight_scale, bias
+    )
+    torch.testing.assert_close(actual, expected, rtol=1e-3, atol=1e-3)
+
+    # Sensitivity guard: skipping the rotation must clearly change the output,
+    # so this test would catch a fallback placed before ConvRot.
+    acted = quantization._apply_input_act(x, "gelu_tanh")
+    no_rot_x, no_rot_scale = quantization.quantize_int8_rowwise(acted)
+    no_rot_ref = torch.nn.functional.linear(
+        no_rot_x.float(), weight.float() * weight_scale.reshape(-1, 1)
+    )
+    no_rot_ref = no_rot_ref * no_rot_scale.reshape(-1, 1)
+    no_rot_ref = no_rot_ref + bias.float()
+    assert (
+        (expected.float() - no_rot_ref).abs().max().item() > 1e-1
+    ), "test input does not exercise ConvRot"
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available()
+    or not getattr(torch.version, "hip", None)
+    or not torch.cuda.get_device_properties(0).gcnArchName.startswith("gfx10"),
+    reason="ROCm gfx10 device required",
+)
+def test_gfx10_fallback_preserves_input_act_and_convrot_contract():
+    """Hardware guard: the fallback must run on a real gfx10 device."""
+    from comfy_kitchen.backends.eager import quantization
+
+    _assert_gfx10_fallback_contract(quantization, *_gfx10_fallback_inputs("cuda"))
+
+
+def test_gfx10_fallback_contract_is_cpu_runnable(monkeypatch):
+    """The P0 fallback guard also runs on CPU, so CI exercises it without a gfx10 card.
+
+    Forcing the gfx10 detector takes the exact float-GEMM fallback branch inside
+    the eager int8_linear implementation; the reference chain below is the same
+    one the hardware test uses.
+    """
+    from comfy_kitchen.backends.eager import quantization
+
+    monkeypatch.setattr(quantization, "_rocm_device_is_gfx10", lambda tensor: True)
+    _assert_gfx10_fallback_contract(quantization, *_gfx10_fallback_inputs("cpu"))
 
 
 def test_cuda_int8_linear_does_not_retain_scratch_tensors():
