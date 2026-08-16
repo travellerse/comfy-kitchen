@@ -71,24 +71,52 @@ What a GPU gets depends on whether it has matrix cores:
 | RDNA4      | `gfx1200`, `gfx1201`        | WMMA + fp8   | All HIP-supported kernels, fp8 native   |
 | RDNA3.5    | `gfx1150`-`gfx1153`         | WMMA, no fp8 | All HIP-supported kernels; fp8 widened  |
 | RDNA3      | `gfx1100`-`gfx1103`         | WMMA, no fp8 | All HIP-supported kernels; fp8 widened  |
-| RDNA2      | `gfx1030`-`gfx1036`         | none         | Non-WMMA kernels incl. AWQ GEMV; WMMA GEMMs decline |
+| RDNA2      | `gfx1030`-`gfx1036`         | none         | Non-WMMA kernels incl. INT8 DP4A and W4A4 sdot8 GEMM |
 
-fp8, int8 and int4 share one byte-addressed tile kernel (`gemm_wmma.h`). RDNA3
-and RDNA4 spread a WMMA operand across the wave differently and RDNA3 has no fp8
-WMMA (it widens to bf16, which is exact), so each has its own set of `Mma`
-policies in `mma.h`; the tile kernel itself is shared.
+The WMMA-backed fp8, int8 and int4 GEMMs share one byte-addressed tile kernel
+(`gemm_wmma.h`); RDNA2 INT8 and W4A4 use the separate DP4A paths in
+`gemm_dp4a.hip` and `gemm_w4a4_dp4a.hip` instead. RDNA3 and RDNA4 spread a
+WMMA operand across the wave differently and
+RDNA3 has no fp8 WMMA (it widens to bf16, which is exact), so each has its own
+set of `Mma` policies in `mma.h`; the tile kernel itself is shared.
 
 RDNA2 has no matrix cores. It runs the kernels that do not need them (RoPE,
-AdaLN and RMS-AdaLN, the quantizers, stochastic rounding, the AWQ GEMV) and does
-not advertise the GEMMs, which fall through to triton/eager. In a process with a
-mix of GPUs the capability set is the intersection, since kernels launch on the
-tensor's own device.
+AdaLN and RMS-AdaLN, the quantizers, stochastic rounding, the AWQ GEMV) plus
+INT8 and W4A4 DP4A paths: wave-reduced INT8 GEMV for small M and LDS-tiled
+GEMMs otherwise. WMMA-only GEMMs still fall through to triton/eager. In a
+process with a mix of GPUs the capability set is the intersection, since
+kernels launch on the tensor's own device.
+
+The INT8 DP4A path splits at a per-device GEMV crossover (M <= 16): the small-M
+kernel reduces K across the wave and the HIP compiler auto-vectorizes its
+packed loads into `v_dot4c_i32_i8`; above it `gemm_dp4a.hip` stages 64x64
+tiles through LDS (BK=128, 4x4 register accumulators per thread) and calls
+`__builtin_amdgcn_sdot4` explicitly, prefetching the next K tile into per-thread
+registers before computing the current tile. Both need K a multiple of 16 and
+16-byte row bases: `int8_linear` materializes contiguous INT8 operands with a
+K%16 row stride, and explicitly aligns the weight with `_aligned`. The epilogue
+is `(acc * scale_a[row] * scale_b[col]) + bias` accumulated in fp32 and written
+out as fp32, fp16 or bf16.
+
+The W4A4 path (`gemm_w4a4_dp4a.hip`) reuses the same 64x64 tile, LDS staging
+and EpiRowwise epilogue, feeding packed int4 rows (two nibbles per byte, K/2
+bytes per row) to `__builtin_amdgcn_sdot8` (`v_dot8_i32_i4`), so no unpack
+kernel is needed; it requires K a multiple of 32. On RDNA2
+`convrot_w4a4_linear` takes this path, while WMMA architectures keep the WMMA
+int4 GEMM.
 
 A request outside a kernel's domain (swizzled operands, scaling other than
 tensor-wise, a K that is not a multiple of 16) falls back to torch or eager.
 NVFP4 and MXFP8 stay on eager everywhere: RDNA has neither fp4 WMMA nor
 microscaling hardware. Set `COMFY_KITCHEN_DISABLE_HIP=1` to remove the backend
 from dispatch.
+
+### RDNA2 validation scope
+
+The INT8 and W4A4 DP4A paths were compiled for the full HIP target manifest
+and run on real hardware only for RX 6700 XT (ROCm reports `gfx1030`). Other
+`gfx103x` targets are compile-validated, not hardware-validated. The INT8 M<=16
+GEMV crossover is a benchmark-supported heuristic, not an autotuned optimum.
 
 ### Building
 
