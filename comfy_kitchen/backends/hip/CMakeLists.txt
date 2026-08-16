@@ -28,11 +28,11 @@ function(_ck_read_arch_group output group_name)
     set(${output} "${_group}" PARENT_SCOPE)
 endfunction()
 
-_ck_read_arch_group(COMFY_HIP_ELEMENTWISE_ARCHS elementwise_only)
+_ck_read_arch_group(COMFY_HIP_NO_WMMA_ARCHS no_wmma)
 _ck_read_arch_group(COMFY_HIP_WMMA_GFX11_ARCHS wmma_gfx11)
 _ck_read_arch_group(COMFY_HIP_WMMA_GFX12_ARCHS wmma_gfx12)
 set(COMFY_HIP_SUPPORTED_ARCHS
-    ${COMFY_HIP_ELEMENTWISE_ARCHS}
+    ${COMFY_HIP_NO_WMMA_ARCHS}
     ${COMFY_HIP_WMMA_GFX11_ARCHS}
     ${COMFY_HIP_WMMA_GFX12_ARCHS}
 )

@@ -1,5 +1,5 @@
 {
-  "elementwise_only": [
+  "no_wmma": [
     "gfx1030",
     "gfx1031",
     "gfx1032",

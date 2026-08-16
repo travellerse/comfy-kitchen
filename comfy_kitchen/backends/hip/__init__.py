@@ -146,18 +146,20 @@ def _visible_gfx_arches() -> tuple[str | None, ...]:
     return tuple(_gfx_arch(i) for i in range(torch.cuda.device_count()))
 
 
-# RDNA2 has no matrix cores; RDNA3/3.5 and RDNA4 do. This exact manifest is also
-# consumed by setup.py and CMake. Never infer support from a gfx prefix: a new
-# compiler-recognized target needs its WMMA policy reviewed before it is safe.
+# RDNA2 has no matrix cores; RDNA3/3.5 and RDNA4 do. The "no_wmma" group names
+# the targets without matrix cores (RDNA2); they still run the non-WMMA GEMMs
+# such as the AWQ GEMV. This exact manifest is also consumed by setup.py and
+# CMake. Never infer support from a gfx prefix: a new compiler-recognized
+# target needs its WMMA policy reviewed before it is safe.
 _ARCH_MANIFEST_PATH = os.path.join(os.path.dirname(__file__), "architectures.json")
 _ARCH_GROUPS = json.loads(
     pathlib.Path(_ARCH_MANIFEST_PATH).read_text(encoding="utf-8")
 )
-_ARCH_ELEMENTWISE_ONLY = frozenset(_ARCH_GROUPS["elementwise_only"])
+_ARCH_NO_WMMA = frozenset(_ARCH_GROUPS["no_wmma"])
 _ARCH_WMMA_GFX11 = frozenset(_ARCH_GROUPS["wmma_gfx11"])
 _ARCH_WMMA_GFX12 = frozenset(_ARCH_GROUPS["wmma_gfx12"])
 _ARCH_WMMA = _ARCH_WMMA_GFX11 | _ARCH_WMMA_GFX12
-_ARCH_SUPPORTED = _ARCH_ELEMENTWISE_ONLY | _ARCH_WMMA
+_ARCH_SUPPORTED = _ARCH_NO_WMMA | _ARCH_WMMA
 
 # The GEMMs, and only the GEMMs, need matrix cores. Everything else is elementwise
 # or a scalar reduction and runs on any supported architecture. This set names the

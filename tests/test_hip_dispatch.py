@@ -22,7 +22,7 @@ _ROOT = pathlib.Path(__file__).resolve().parents[1]
 _HIP_DIR = _ROOT / "comfy_kitchen" / "backends" / "hip"
 _HIP_CMAKE = _HIP_DIR / "CMakeLists.txt"
 _HIP_ARCH_MANIFEST = _HIP_DIR / "architectures.json"
-_HIP_ARCH_GROUP_NAMES = ("elementwise_only", "wmma_gfx11", "wmma_gfx12")
+_HIP_ARCH_GROUP_NAMES = ("no_wmma", "wmma_gfx11", "wmma_gfx12")
 
 
 def _architecture_groups() -> dict[str, list[str]]:
@@ -270,7 +270,7 @@ def test_architecture_manifest_is_unique_and_shared_by_setup_and_runtime():
     assert len(manifest_archs) == len(set(manifest_archs))
     assert tuple(manifest_archs) == namespace["SUPPORTED_HIP_ARCHS"]
     assert manifest_archs == namespace["DEFAULT_HIP_ARCHS"].split(";")
-    assert set(groups["elementwise_only"]) == hip_backend._ARCH_ELEMENTWISE_ONLY
+    assert set(groups["no_wmma"]) == hip_backend._ARCH_NO_WMMA
     assert set(groups["wmma_gfx11"]) == hip_backend._ARCH_WMMA_GFX11
     assert set(groups["wmma_gfx12"]) == hip_backend._ARCH_WMMA_GFX12
     assert set(manifest_archs) == hip_backend._ARCH_SUPPORTED
