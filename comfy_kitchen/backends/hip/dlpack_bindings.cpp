@@ -308,7 +308,7 @@ void scaled_mm_fp8(nb::ndarray<> a, nb::ndarray<> b, nb::ndarray<> c, nb::ndarra
 
 void int8_gemm(nb::ndarray<> a, nb::ndarray<> b, nb::ndarray<> c, nb::ndarray<> scale_a,
                nb::ndarray<> scale_b, int scale_b_stride, OptArray bias, int M, int N, int K,
-               int out_code, uintptr_t stream_ptr) {
+               int out_code, int gemv_max_m, uintptr_t stream_ptr) {
     constexpr const char* kFn = "int8_gemm";
     // EpiRowwise reads scale_a[row] over M rows and scale_b[col * stride] over N
     // columns; a stride of 0 collapses the weight scale to a single scalar.
@@ -316,9 +316,24 @@ void int8_gemm(nb::ndarray<> a, nb::ndarray<> b, nb::ndarray<> c, nb::ndarray<> 
         throw std::runtime_error(std::string(kFn) + ": scale_b_stride must be 0 or 1, got " +
                                  std::to_string(scale_b_stride));
     }
+    // gemv_max_m comes from Python's _int8_gemv_max_m(), whose canonical RDNA2
+    // threshold is _INT8_GEMV_MAX_M (16) and whose WMMA default is 8. It selects
+    // the GEMV branch inside launch_int8_gemm_kernel, so the accepted range must
+    // stay at least as wide as _INT8_GEMV_MAX_M; keep the two in sync.
+    if (gemv_max_m < 1 || gemv_max_m > 16) {
+        throw std::runtime_error(std::string(kFn) + ": gemv_max_m must be in [1, 16], got " +
+                                 std::to_string(gemv_max_m));
+    }
     require_nonneg(M, kFn, "M");
     require_nonneg(N, kFn, "N");
     require_nonneg(K, kFn, "K");
+    // Both the small-M GEMV and the WMMA tile loader read a row 16 bytes at a
+    // time, so the int8 operand bases must be 16-byte aligned. Python's
+    // _aligned() materializes that; this is the final guard for direct callers.
+    if ((reinterpret_cast<uintptr_t>(a.data()) % 16) != 0 ||
+        (reinterpret_cast<uintptr_t>(b.data()) % 16) != 0) {
+        throw std::runtime_error(std::string(kFn) + ": operands must be 16-byte aligned");
+    }
     // a is (M, K) int8, b is (N, K) int8, c is (M, N).
     require_dtype(a, 4, 4, kFn, "a");
     require_dtype(b, 4, 4, kFn, "b");
@@ -333,7 +348,40 @@ void int8_gemm(nb::ndarray<> a, nb::ndarray<> b, nb::ndarray<> c, nb::ndarray<> 
 
     launch_int8_gemm_kernel(a.data(), b.data(), c.data(), scale_a.data(), scale_b.data(),
                             scale_b_stride, opt_data(bias), opt_code(bias), M, N, K, N /*ldc*/,
-                            out_code, reinterpret_cast<hipStream_t>(stream_ptr));
+                            out_code, gemv_max_m, reinterpret_cast<hipStream_t>(stream_ptr));
+    check_hip_launch();
+}
+
+void int8_gemm_dp4a(nb::ndarray<> a, nb::ndarray<> b, nb::ndarray<> c,
+                    nb::ndarray<> scale_a, nb::ndarray<> scale_b, int scale_b_stride,
+                    OptArray bias, int M, int N, int K, int out_code, uintptr_t stream_ptr) {
+    constexpr const char* kFn = "int8_gemm_dp4a";
+    if (scale_b_stride != 0 && scale_b_stride != 1) {
+        throw std::runtime_error(std::string(kFn) + ": scale_b_stride must be 0 or 1");
+    }
+    if ((reinterpret_cast<uintptr_t>(a.data()) % 16) != 0 ||
+        (reinterpret_cast<uintptr_t>(b.data()) % 16) != 0) {
+        throw std::runtime_error(std::string(kFn) + ": operands must be 16-byte aligned");
+    }
+    require_nonneg(M, kFn, "M");
+    require_nonneg(N, kFn, "N");
+    require_nonneg(K, kFn, "K");
+    require_dtype(a, 4, 4, kFn, "a");
+    require_dtype(b, 4, 4, kFn, "b");
+    require_dtype(c, 0, 2, kFn, "c");
+    require_out_matches(c, out_code, kFn);
+    require_len(a, static_cast<int64_t>(M) * K, kFn, "a");
+    require_len(b, static_cast<int64_t>(N) * K, kFn, "b");
+    require_len(c, static_cast<int64_t>(M) * N, kFn, "c");
+    require_scale_len(scale_a, static_cast<size_t>(M), kFn, "scale_a");
+    require_scale_len(scale_b, scale_b_stride == 1 ? static_cast<size_t>(N) : 1,
+                      kFn, "scale_b");
+    require_bias(bias, N, kFn);
+
+    launch_int8_gemm_dp4a_kernel(
+        a.data(), b.data(), c.data(), scale_a.data(), scale_b.data(), scale_b_stride,
+        opt_data(bias), opt_code(bias), M, N, K, out_code,
+        reinterpret_cast<hipStream_t>(stream_ptr));
     check_hip_launch();
 }
 
@@ -1353,6 +1401,7 @@ NB_MODULE(_C, m) {
     m.def("stochastic_round_fp8", &stochastic_round_fp8);
     m.def("scaled_mm_fp8", &scaled_mm_fp8);
     m.def("int8_gemm", &int8_gemm);
+    m.def("int8_gemm_dp4a", &int8_gemm_dp4a);
     m.def("convrot_w4a4_gemm", &convrot_w4a4_gemm);
     m.def("quantize_int8_rowwise", &quantize_int8_rowwise);
     m.def("quantize_int8_convrot", &quantize_int8_convrot);

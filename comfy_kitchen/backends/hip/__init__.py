@@ -10,8 +10,9 @@ fragment layouts differ, and RDNA3 has no fp8 WMMA, so it widens fp8 to bf16;
 see mma.h.
 
 RDNA2 (gfx103x) has no matrix cores. It runs the elementwise kernels (RoPE,
-AdaLN and RMS-AdaLN, the quantizers, stochastic rounding, the AWQ GEMV) and
-declines the GEMMs, which fall through to triton/eager.
+AdaLN and RMS-AdaLN, the quantizers, stochastic rounding), the AWQ GEMV, and
+INT8 DP4A GEMV/GEMM. It declines WMMA-only GEMMs, which fall through to
+triton/eager.
 """
 import functools
 import importlib.util
@@ -161,18 +162,26 @@ _ARCH_WMMA_GFX12 = frozenset(_ARCH_GROUPS["wmma_gfx12"])
 _ARCH_WMMA = _ARCH_WMMA_GFX11 | _ARCH_WMMA_GFX12
 _ARCH_SUPPORTED = _ARCH_NO_WMMA | _ARCH_WMMA
 
-# The GEMMs, and only the GEMMs, need matrix cores. Everything else is elementwise
-# or a scalar reduction and runs on any supported architecture. This set names the
-# registry-dispatched GEMMs so _build_constraints can drop them on RDNA2; the fp8
-# GEMM is not among them because it is reached through scaled_mm_v2's _hip_fp8_gemm,
-# which gates on has_wmma() itself rather than through the registry.
+# These GEMMs need matrix cores. Everything else is elementwise, a scalar
+# reduction, or has a separate non-WMMA path. This set names the
+# registry-dispatched operations that _build_constraints must drop on RDNA2;
+# int8_linear is intentionally absent: RDNA2 runs it through the DP4A
+# GEMV/GEMM paths instead. The fp8 GEMM is reached through scaled_mm_v2's
+# _hip_fp8_gemm, which gates on has_wmma() itself.
 _WMMA_ONLY_OPS = frozenset({
-    "int8_linear",
     "na3d",
     "convrot_w4a4_linear",
     "scaled_mm_svdquant_w4a4",
     "w4a8_int8_linear",
 })
+
+
+# Canonical GEMV/GEMM crossover for the RDNA2 DP4A path, tuned on RX 6700 XT
+# (gfx1030): at M <= 16 the wave-reduced GEMV wins, above it the LDS-tiled
+# DP4A GEMM. Benchmark-supported heuristic, not an autotuned optimum. The C++
+# int8_gemm binding accepts any value in [1, 16] and must stay in sync with
+# this constant.
+_INT8_GEMV_MAX_M = 16
 
 
 def _unsupported_arch_reason(arches: Sequence[str | None]) -> str | None:
@@ -219,6 +228,19 @@ def has_wmma() -> bool:
         and _unsupported_arch_reason(arches) is None
         and _has_wmma(arches)
     )
+
+
+def _int8_gemv_max_m(device: torch.device) -> int:
+    """Return the tuned GEMV limit for one device, defaulting to the WMMA policy."""
+    index = device.index
+    arches = _visible_gfx_arches()
+    if index is None or index < 0 or index >= len(arches):
+        return 8
+    if arches[index] in _ARCH_NO_WMMA:
+        return _INT8_GEMV_MAX_M
+    # 8 is the WMMA-default crossover upstream hardcoded before the DP4A path;
+    # keep in sync with the w4a8_dequant.hip call site.
+    return 8
 
 
 def _stream(t: torch.Tensor) -> int:
@@ -614,7 +636,7 @@ def int8_linear(
     convrot_groupsize: int = 256,
     input_act: str | None = None,
 ) -> torch.Tensor:
-    """INT8 linear with dynamic row-wise activation quantization, on WMMA."""
+    """INT8 linear with dynamic row-wise activation quantization."""
     # Rejected here so every route fails the same way, not just the fused one.
     _input_act_code(input_act)
     # k_act is the activated (quantized) row width: swiglu halves the raw row.
@@ -666,13 +688,69 @@ def int8_linear(
         bias = _bias_operand(bias, n, x.device)
 
     out = torch.empty((m, n), dtype=out_dtype, device=x.device)
-    _C.int8_gemm(
-        _dl(q), _dl(weight), _dl(out),
-        _dl(x_scale), _dl(weight_scale), 0 if weight_scale.numel() == 1 else 1,
-        None if bias is None else _dl(bias),
-        m, n, k, DTYPE_TO_CODE[out_dtype], _stream(x),
+    gemv_max_m = _int8_gemv_max_m(x.device)
+    gemm_args = (
+        _dl(q), _dl(weight), _dl(out), _dl(x_scale), _dl(weight_scale),
+        0 if weight_scale.numel() == 1 else 1, None if bias is None else _dl(bias),
+        m, n, k, DTYPE_TO_CODE[out_dtype],
     )
+    if _gfx_arch(x.device) in _ARCH_NO_WMMA and m > gemv_max_m:
+        _C.int8_gemm_dp4a(*gemm_args, _stream(x))
+    else:
+        _C.int8_gemm(*gemm_args, gemv_max_m, _stream(x))
     return out.reshape(*orig_shape[:-1], n)
+
+
+def _int8_gemm_dp4a_direct(
+    a: torch.Tensor,
+    weight: torch.Tensor,
+    scale_a: torch.Tensor,
+    scale_b: torch.Tensor,
+    bias: torch.Tensor | None = None,
+    out_dtype: torch.dtype = torch.float32,
+) -> torch.Tensor:
+    """Direct RDNA2 DP4A GEMM entry for tests only.
+
+    Not registered for auto dispatch: ``int8_linear`` is the production route,
+    and this is a strict-contract helper that locks the kernel's operand and
+    scale semantics in isolation. Contract: ``a`` and ``weight`` are 2D int8,
+    contiguous, ``K % 16 == 0``, and 16-byte-aligned; the operand helpers
+    below materialize and enforce that, and the checks make it explicit so a
+    future caller cannot rely on luck.
+    """
+    if _gfx_arch(a.device) not in _ARCH_NO_WMMA:
+        raise RuntimeError("DP4A GEMM requires a validated RDNA2 target")
+    if a.dim() != 2 or weight.dim() != 2 or a.dtype != torch.int8 or weight.dtype != torch.int8:
+        raise ValueError("a and weight must be 2D int8 tensors")
+    m, k = a.shape
+    n, weight_k = weight.shape
+    if weight_k != k:
+        raise ValueError(f"inner dimensions must match, got {k} and {weight_k}")
+    if k % 16 != 0:
+        raise ValueError(f"DP4A GEMM requires K divisible by 16, got {k}")
+    if out_dtype not in _EPILOGUE_DTYPES:
+        raise ValueError(f"unsupported output dtype {out_dtype}")
+
+    a = _operand(a, a.device, "a", (m, k))
+    weight = _operand(weight, a.device, "weight", (n, k))
+    if a.data_ptr() % 16 != 0 or weight.data_ptr() % 16 != 0:
+        raise ValueError("DP4A GEMM requires 16-byte-aligned operands")
+    scale_a = scale_a.to(device=a.device, dtype=torch.float32).reshape(-1).contiguous()
+    scale_b = scale_b.to(device=a.device, dtype=torch.float32).reshape(-1).contiguous()
+    if scale_a.numel() != m:
+        raise ValueError(f"scale_a must have {m} elements, got {scale_a.numel()}")
+    if scale_b.numel() not in (1, n):
+        raise ValueError(f"scale_b must have 1 or {n} elements, got {scale_b.numel()}")
+    if bias is not None:
+        bias = _bias_operand(bias, n, a.device)
+
+    out = torch.empty((m, n), dtype=out_dtype, device=a.device)
+    _C.int8_gemm_dp4a(
+        _dl(a), _dl(weight), _dl(out), _dl(scale_a), _dl(scale_b),
+        0 if scale_b.numel() == 1 else 1, None if bias is None else _dl(bias),
+        m, n, k, DTYPE_TO_CODE[out_dtype], _stream(a),
+    )
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -2006,9 +2084,8 @@ def _build_constraints(has_wmma: bool = True) -> dict:
         constraints[inplace_name] = constraints[functional_name]
 
     if not has_wmma:
-        # RDNA2: the GEMM kernels are compiled but trap, so they must not be
-        # advertised. Dropping them here routes those ops to triton/eager while the
-        # elementwise kernels below still dispatch to HIP.
+        # RDNA2: WMMA kernels are compiled but trap, so they must not be advertised.
+        # INT8 uses the DP4A GEMV/GEMM; the WMMA-only GEMMs route to triton/eager.
         constraints = {k: v for k, v in constraints.items() if k not in _WMMA_ONLY_OPS}
 
     return constraints
@@ -2219,7 +2296,7 @@ def _register():
     logger.debug(
         "registered HIP backend for %s (%s)",
         ", ".join(sorted({a for a in arches if a})),
-        "with WMMA" if has_wmma else "elementwise only, no matrix cores",
+        "with WMMA" if has_wmma else "with DP4A GEMV/GEMM, no matrix cores",
     )
 
 

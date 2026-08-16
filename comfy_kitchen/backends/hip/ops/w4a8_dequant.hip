@@ -134,7 +134,9 @@ extern "C" void launch_w4a8_int8_gemm_chunked_kernel(
             xq, workspace, static_cast<char*>(out) + n0 * dtype_size(out_code), xs,
             static_cast<const float*>(s_channel) + n0, 1,
             bias ? static_cast<const char*>(bias) + n0 * dtype_size(bias_code) : nullptr,
-            bias_code, M, cols, K, N /*ldc*/, out_code, stream);
+            bias_code, M, cols, K, N /*ldc*/, out_code,
+            /*gemv_max_m*/ 8 /* WMMA default; keep in sync with _int8_gemv_max_m() */,
+            stream);
     }
 }
 

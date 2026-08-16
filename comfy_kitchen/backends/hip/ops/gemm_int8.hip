@@ -45,11 +45,11 @@ __global__ __launch_bounds__(256) void gemv_int8_kernel(
 
 template <typename OutT>
 static void launch_int8(const int8_t* A, const int8_t* B, OutT* C, int M, int N, int K, int ldc,
-                        EpiRowwise epi, hipStream_t stream) {
+                        EpiRowwise epi, int gemv_max_m, hipStream_t stream) {
     const uint8_t* Au = reinterpret_cast<const uint8_t*>(A);
     const uint8_t* Bu = reinterpret_cast<const uint8_t*>(B);
 
-    if (M <= 8) {
+    if (M <= gemv_max_m) {
         dim3 block(kWave, 8);
         dim3 grid((N + 7) / 8, M);
         gemv_int8_kernel<OutT><<<grid, block, 0, stream>>>(A, B, C, M, N, K, ldc, epi);
@@ -80,7 +80,7 @@ extern "C" void launch_int8_gemm_kernel(
     const void* a, const void* b, void* c,
     const void* scale_a, const void* scale_b, int scale_b_stride,
     const void* bias, int bias_code,
-    int M, int N, int K, int ldc, int out_code, hipStream_t stream) {
+    int M, int N, int K, int ldc, int out_code, int gemv_max_m, hipStream_t stream) {
 
     using namespace comfy::hip_backend;
 
@@ -106,11 +106,11 @@ extern "C" void launch_int8_gemm_kernel(
     const int8_t* B = static_cast<const int8_t*>(b);
 
     if (out_code == kBF16) {
-        launch_int8<__bf16>(A, B, static_cast<__bf16*>(c), M, N, K, ldc, epi, stream);
+        launch_int8<__bf16>(A, B, static_cast<__bf16*>(c), M, N, K, ldc, epi, gemv_max_m, stream);
     } else if (out_code == kF16) {
-        launch_int8<__half>(A, B, static_cast<__half*>(c), M, N, K, ldc, epi, stream);
+        launch_int8<__half>(A, B, static_cast<__half*>(c), M, N, K, ldc, epi, gemv_max_m, stream);
     } else if (out_code == kF32) {
-        launch_int8<float>(A, B, static_cast<float*>(c), M, N, K, ldc, epi, stream);
+        launch_int8<float>(A, B, static_cast<float*>(c), M, N, K, ldc, epi, gemv_max_m, stream);
     } else {
         throw std::runtime_error("int8_gemm: unsupported output dtype");
     }

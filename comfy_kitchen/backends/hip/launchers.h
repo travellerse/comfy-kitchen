@@ -21,11 +21,12 @@ void launch_na3d_kernel(const void* q, const void* k, const void* v, void* out, 
                         int dtype_code, hipStream_t stream);
 
 // ldc is c's row stride, so a caller writing an N-column slice of a wider output
-// passes that output's width; a whole GEMM passes N.
+// passes that output's width; a whole GEMM passes N. gemv_max_m is the M below
+// which the small-M GEMV runs instead of the WMMA tile GEMM.
 void launch_int8_gemm_kernel(const void* a, const void* b, void* c, const void* scale_a,
                              const void* scale_b, int scale_b_stride, const void* bias,
                              int bias_code, int M, int N, int K, int ldc, int out_code,
-                             hipStream_t stream);
+                             int gemv_max_m, hipStream_t stream);
 
 // RDNA2 DP4A GEMM (ops/gemm_dp4a.hip); see launch_int8_gemm_kernel for scale/bias layout.
 void launch_int8_gemm_dp4a_kernel(const void* a, const void* b, void* c, const void* scale_a,
