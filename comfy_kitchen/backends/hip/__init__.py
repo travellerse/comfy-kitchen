@@ -174,7 +174,6 @@ _WMMA_ONLY_OPS = frozenset({
     "w4a8_int8_linear",
 })
 
-
 # Canonical GEMV/GEMM crossover for the RDNA2 DP4A path, tuned on RX 6700 XT
 # (gfx1030): at M <= 16 the wave-reduced GEMV wins, above it the LDS-tiled
 # DP4A GEMM. Benchmark-supported heuristic, not an autotuned optimum. The C++
@@ -1231,7 +1230,7 @@ def convrot_w4a4_linear(
         # with the WMMA path, so only the GEMM execution differs.
         _C.w4a4_gemm_dp4a(
             _dl(qact), _dl(qw), _dl(out),
-            _dl(x_scale), _dl(wscales), 1,
+            _dl(x_scale), _dl(wscales),
             None if bias is None else _dl(bias),
             m, n, k, DTYPE_TO_CODE[x.dtype], _stream(x),
         )

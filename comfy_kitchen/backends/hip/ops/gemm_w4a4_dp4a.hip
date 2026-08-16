@@ -135,7 +135,7 @@ void launch_w4a4_dp4a(const uint8_t* A, const uint8_t* B, OutT* C,
 
 extern "C" void launch_w4a4_gemm_dp4a_kernel(
     const void* a, const void* b, void* c,
-    const void* scale_a, const void* scale_b, int scale_b_stride,
+    const void* scale_a, const void* scale_b,
     const void* bias, int bias_code,
     int M, int N, int K, int out_code, hipStream_t stream) {
 
@@ -148,8 +148,11 @@ extern "C" void launch_w4a4_gemm_dp4a_kernel(
                                  " must be a multiple of 32");
     }
 
+    // Weight scales are per-output-channel only (the W4A4 quantizer emits one
+    // scale per row and convrot_w4a4_linear rejects any other length), so the
+    // epilogue stride is fixed at 1 rather than a parameter.
     EpiRowwise epi{static_cast<const float*>(scale_a), static_cast<const float*>(scale_b),
-                   scale_b_stride, bias, bias_code};
+                   1, bias, bias_code};
     const uint8_t* A = static_cast<const uint8_t*>(a);
     const uint8_t* B = static_cast<const uint8_t*>(b);
 
