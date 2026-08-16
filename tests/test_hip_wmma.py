@@ -1,8 +1,9 @@
 """Correctness tests for the HIP backend.
 
 Skipped unless the backend registered, which requires an RDNA2/3/4 device and the
-compiled extension. The GEMM tests need matrix cores on top of that, so they are
-skipped on RDNA2, which has none; see needs_wmma.
+compiled extension. Most GEMM tests need matrix cores on top of that, so they are
+skipped on RDNA2, which has none; see needs_wmma. INT8 GEMV/GEMM instead run
+there through DP4A paths.
 """
 import pytest
 import torch
@@ -20,6 +21,8 @@ from comfy_kitchen.constraints import validate_function_call
 from comfy_kitchen.registry import registry
 from comfy_kitchen.tensor import AsymW4A8Int8Layout, QuantizedTensor
 from comfy_kitchen.tensor.int8_utils import _build_hadamard
+
+from .conftest import assert_values_close
 
 
 def _unavailable_reason() -> str | None:
@@ -51,10 +54,13 @@ def _has_wmma() -> bool:
 
 HAS_WMMA = _has_wmma()
 
-# The GEMMs compile on RDNA2 but trap: it has no matrix cores, and the backend
-# does not advertise them there. An absent backend reports why instead.
+# WMMA GEMMs compile on RDNA2 but trap: it has no matrix cores, and the backend
+# does not advertise those paths there. An absent backend reports why instead.
 needs_wmma = pytest.mark.skipif(
     not HAS_WMMA, reason=_UNAVAILABLE or "GEMM kernels need matrix cores (RDNA3/RDNA4)"
+)
+needs_rdna2_dp4a = pytest.mark.skipif(
+    HAS_WMMA, reason="direct DP4A GEMM is specific to RDNA2"
 )
 
 DEV = "cuda"
@@ -67,11 +73,425 @@ def hip():
     return hip_backend
 
 
-# Covers each tile path: GEMV (M <= 8), 64x64, 128x128 and 256x128 (K > N), plus
-# sizes that are not multiples of the macro tile.
+@needs_rdna2_dp4a
+def test_int8_dp4a_direct_matches_reference_at_tile_edges(hip):
+    torch.manual_seed(0)
+    m, n, k = 65, 67, 80
+    a = torch.randint(-127, 128, (m, k), dtype=torch.int8, device=DEV)
+    b = torch.randint(-127, 128, (n, k), dtype=torch.int8, device=DEV)
+    scale_a = torch.rand(m, dtype=torch.float32, device=DEV) * 0.02
+    scale_b = torch.rand(n, dtype=torch.float32, device=DEV) * 0.02
+    bias = torch.randn(n, dtype=torch.float32, device=DEV)
+
+    out = hip._int8_gemm_dp4a_direct(a, b, scale_a, scale_b, bias, torch.float32)
+
+    ref = a.float() @ b.float().T
+    ref *= scale_a[:, None] * scale_b[None, :]
+    ref += bias
+    torch.testing.assert_close(out, ref, rtol=1e-5, atol=1e-4)
+
+
+@needs_rdna2_dp4a
+def test_int8_dp4a_direct_accepts_non_contiguous_operands(hip):
+    """The direct entry normalizes views: contiguous + 16-byte aligned copies."""
+    torch.manual_seed(6)
+    m, n, k = 33, 35, 80
+    base_a = torch.randint(-127, 128, (m, k + 8), dtype=torch.int8, device=DEV)
+    a = base_a[:, 4 : 4 + k]  # non-contiguous view, misaligned base
+    base_b = torch.randint(-127, 128, (n, k + 8), dtype=torch.int8, device=DEV)
+    b = base_b[:, 4 : 4 + k]
+    scale_a = torch.rand(m, device=DEV) * 0.02
+    scale_b = torch.rand(n, device=DEV) * 0.02
+    bias = torch.randn(n, device=DEV)
+
+    out = hip._int8_gemm_dp4a_direct(a, b, scale_a, scale_b, bias, torch.float32)
+
+    ref = a.float() @ b.float().T
+    ref *= scale_a[:, None] * scale_b[None, :]
+    ref += bias
+    torch.testing.assert_close(out, ref, rtol=1e-5, atol=1e-4)
+
+
+@needs_rdna2_dp4a
+@pytest.mark.parametrize("binding", ["int8_gemm", "int8_gemm_dp4a"])
+def test_int8_gemm_bindings_reject_misaligned_operands(hip, binding):
+    """The C++ bindings are the final 16-byte alignment guard.
+
+    Both the small-M GEMV branch (the production RDNA2 path for M <= 16, reached
+    through int8_gemm) and the DP4A/WMMA tile loaders read rows 16 bytes at a
+    time, so a misaligned base must be rejected here instead of letting the
+    kernel trap.
+    """
+    m, n, k = 4, 4, 16
+    storage = torch.zeros(m * k + 1, dtype=torch.int8, device=DEV)
+    a = storage[1 : 1 + m * k].reshape(m, k)  # data_ptr % 16 == 1
+    b = torch.zeros(n * k, dtype=torch.int8, device=DEV).reshape(n, k)
+    out = torch.zeros(m, n, dtype=torch.float32, device=DEV)
+    scale_a = torch.ones(m, device=DEV)
+    scale_b = torch.ones(n, device=DEV)
+
+    args = [
+        hip._dl(a),
+        hip._dl(b),
+        hip._dl(out),
+        hip._dl(scale_a),
+        hip._dl(scale_b),
+        1,
+        None,
+        m,
+        n,
+        k,
+        0,
+    ]
+    if binding == "int8_gemm":
+        args.append(16)  # gemv_max_m
+    args.append(hip._stream(a))
+
+    with pytest.raises(RuntimeError, match="16-byte aligned"):
+        getattr(hip._C, binding)(*args)
+
+
+@needs_rdna2_dp4a
+def test_convrot_w4a4_linear_dispatches_to_rdna2_dp4a():
+    """On RDNA2 the public convrot_w4a4_linear must run the sdot8 HIP path.
+
+    The registry advertises convrot_w4a4_linear on gfx103x (the WMMA GEMM would
+    trap there), so the default dispatch resolves to HIP and the sdot8 kernel
+    executes the shared quantizer + per-row-scale contract. A regression that
+    drops it back to eager, or sends gfx103x to the WMMA GEMM, fails here.
+    """
+    from comfy_kitchen.backends import hip as hip_backend
+
+    # Dispatch contract: HIP advertises convrot_w4a4_linear without matrix
+    # cores (it has the sdot8 path), unlike the WMMA-only ops.
+    assert "convrot_w4a4_linear" in hip_backend._build_constraints(has_wmma=False)
+
+    torch.manual_seed(0)
+    m, n, k = 65, 67, 256
+    x = torch.randn(m, k, device=DEV, dtype=torch.bfloat16)
+    w = torch.randn(n, k, device=DEV, dtype=torch.bfloat16)
+    qw, ws = ck.quantize_convrot_w4a4_weight(w, 256)
+    # Default dispatch: on gfx103x this resolves to HIP's sdot8 path.
+    out = ck.convrot_w4a4_linear(x, qw, ws, None, 256)
+    with ck.use_backend("eager"):
+        qw_e, ws_e = ck.quantize_convrot_w4a4_weight(w, 256)
+        ref = ck.convrot_w4a4_linear(x, qw_e, ws_e, None, 256)
+
+    assert out.shape == (m, n)
+    # W4A4 has 15 levels per operand, so agreement is coarse: this asserts the
+    # dispatched path computes the same function, not that it rounds identically.
+    scale = ref.float().abs().max().item()
+    assert (out.float() - ref.float()).abs().max().item() < 0.25 * scale
+
+
+@needs_rdna2_dp4a
+def test_convrot_w4a4_linear_int8_dispatch_matches_hip_int8_linear_on_rdna2(hip):
+    """On RDNA2, convrot_w4a4_linear(linear_dtype="int8") must dispatch to the
+    HIP INT8 path, not the eager fallback.
+
+    The HIP int4 path has an upstream "int8" sub-branch that unpacks the packed
+    int4 weight with _C.unpack_int4 and runs int8_linear(..., convrot=True), i.e.
+    the activation is quantized to int8. Before the RDNA2 dispatch change, gfx10
+    fell back to eager, whose convrot_w4a4_linear ignores linear_dtype and always
+    quantizes the activation to int4 -- a different result. This test locks the
+    post-change contract: the dispatched call equals the explicit HIP INT8 chain,
+    and would fail by ~14% of scale if dispatch regressed to eager.
+    """
+    torch.manual_seed(1234)
+    m, n, k = 8, 16, 256
+    x = torch.randn(m, k, device=DEV, dtype=torch.float32) * 0.7
+    w = torch.randn(n, k, device=DEV, dtype=torch.float32) * 0.7
+    qw, ws = ck.quantize_convrot_w4a4_weight(w, 256)
+    ws = ws.reshape(-1)
+    bias = torch.randn(n, device=DEV, dtype=torch.float32) * 0.1
+
+    # Explicit HIP INT8 chain, mirroring convrot_w4a4_linear's linear_dtype=="int8"
+    # branch: unpack the packed int4 weight, then int8_linear with convrot=True.
+    qw_d = hip._operand(qw, DEV, "qweight", shape=(n, k // 2))
+    w_int8 = torch.empty((n, k), dtype=torch.int8, device=DEV)
+    hip._C.unpack_int4(hip._dl(qw_d), hip._dl(w_int8), qw_d.numel(), hip._stream(qw_d))
+    ref = hip.int8_linear(x, w_int8, ws, bias, torch.float32,
+                          convrot=True, convrot_groupsize=256)
+
+    out = ck.convrot_w4a4_linear(x, qw, ws, bias, 256, linear_dtype="int8")
+
+    torch.testing.assert_close(out, ref, rtol=1e-5, atol=1e-5)
+
+
+@needs_rdna2_dp4a
+@pytest.mark.parametrize(
+    ("m", "n", "k", "pattern"),
+    [
+        (1, 1, 32, "random"),
+        (2, 1, 64, "zero"),
+        (4, 4, 32, "all7"),
+        (4, 16, 64, "random"),
+        (16, 64, 256, "random"),
+        (65, 67, 256, "random"),
+        (4, 1, 1024, "random"),
+    ],
+)
+def test_w4a4_gemm_dp4a_matches_nibble_reference(hip, m, n, k, pattern):
+    """The packed-int4 sdot8 GEMM matches the eager W4A4 math exactly.
+
+    Reference: out = (unpack_signed(qa) @ unpack_signed(qw)^T) * xs[row] * ws[col]
+    + bias. The fp32 reference is exact here: |q| <= 7 and K <= 1024 keep every
+    int32 accumulator below 2^24, so the fp32 matmul reproduces the exact integer
+    sum and the kernel's epilogue runs the same float ops in the same order.
+    """
+    from comfy_kitchen.backends.eager.svdquant import (
+        _pack_int4_row_major,
+        _unpack_int4_row_major,
+    )
+
+    torch.manual_seed(1234)
+    if pattern == "zero":
+        qa = torch.zeros(m, k, dtype=torch.int32)
+        qw = torch.zeros(n, k, dtype=torch.int32)
+    elif pattern == "all7":
+        qa = torch.full((m, k), 7, dtype=torch.int32)
+        qw = torch.full((n, k), 7, dtype=torch.int32)
+    else:
+        qa = torch.randint(-7, 8, (m, k), dtype=torch.int32)
+        qw = torch.randint(-7, 8, (n, k), dtype=torch.int32)
+    xs = torch.rand(m, device=DEV, dtype=torch.float32) * 0.02 + 0.01
+    ws = torch.rand(n, device=DEV, dtype=torch.float32) * 0.02 + 0.01
+    bias = torch.randn(n, device=DEV, dtype=torch.float32) * 0.05
+
+    a_cpu = _pack_int4_row_major(qa)
+    b_cpu = _pack_int4_row_major(qw)
+    a = a_cpu.to(device=DEV).contiguous()
+    b = b_cpu.to(device=DEV).contiguous()
+    out = torch.empty((m, n), dtype=torch.float32, device=DEV)
+    hip._C.w4a4_gemm_dp4a(
+        hip._dl(a),
+        hip._dl(b),
+        hip._dl(out),
+        hip._dl(xs),
+        hip._dl(ws),
+        hip._dl(bias),
+        m,
+        n,
+        k,
+        0,
+        hip._stream(a),
+    )
+
+    ref = (_unpack_int4_row_major(a_cpu).float() @ _unpack_int4_row_major(b_cpu).float().T)
+    ref = ref * xs.cpu()[:, None] * ws.cpu()[None, :] + bias.cpu()[None, :]
+    torch.testing.assert_close(out.cpu(), ref, rtol=1e-5, atol=1e-5)
+
+
+@needs_rdna2_dp4a
+def test_w4a4_gemm_dp4a_rejects_k_not_multiple_of_32(hip):
+    """The launcher is the final K % 32 guard for packed 16-byte staging."""
+    m, n, k = 4, 4, 80  # K / 2 = 40 bytes per row: not whole 16-byte chunks
+    a = torch.zeros(m * (k // 2), dtype=torch.int8, device=DEV).reshape(m, k // 2)
+    b = torch.zeros(n * (k // 2), dtype=torch.int8, device=DEV).reshape(n, k // 2)
+    out = torch.zeros(m, n, dtype=torch.float32, device=DEV)
+    scale_a = torch.ones(m, device=DEV)
+    scale_b = torch.ones(n, device=DEV)
+
+    with pytest.raises(RuntimeError, match="multiple of 32"):
+        hip._C.w4a4_gemm_dp4a(
+            hip._dl(a),
+            hip._dl(b),
+            hip._dl(out),
+            hip._dl(scale_a),
+            hip._dl(scale_b),
+            None,
+            m,
+            n,
+            k,
+            0,
+            hip._stream(a),
+        )
+
+
+@needs_rdna2_dp4a
+def test_int8_dp4a_auto_convrot_fp32_matches_eager_at_tile_edges():
+    torch.manual_seed(1)
+    m, n, k = 65, 67, 256
+    x = torch.randn(m, k, device=DEV, dtype=torch.float32)
+    w = torch.randn(n, k, device=DEV, dtype=torch.float32)
+    wq, ws = ck.quantize_int8_rowwise(w)
+    bias = torch.randn(n, device=DEV, dtype=torch.float32)
+
+    with ck.use_backend("hip"):
+        out = ck.int8_linear(
+            x, wq, ws.reshape(-1), bias, torch.float32,
+            convrot=True, convrot_groupsize=256,
+        )
+    with ck.use_backend("eager"):
+        ref = ck.int8_linear(
+            x, wq, ws.reshape(-1), bias, torch.float32,
+            convrot=True, convrot_groupsize=256,
+        )
+
+    # Both paths rotate and quantize; HIP uses the fused radix-4 quantizer while
+    # eager rotates with the Hadamard matrix, so the tolerance is the fused-vs-
+    # eager ConvRot rounding gap rather than an int8 accumulation gap.
+    scale = ref.abs().max().item()
+    assert (out - ref).abs().max().item() < 0.05 * scale
+
+
+# RDNA2 DP4A auto path: shapes crossing the GEMV/GEMM crossover at M=16 plus
+# tile-edge and skinny shapes. K is a multiple of 16 but deliberately not of
+# the BK=128 GEMM tile, so the tail tile is zero-padded; K=16 and K=32 are
+# smaller than the tile, so every row's tile is zero-padded from its first
+# chunk.
+#
+# The reference is exact INT8 math, not the eager backend: on gfx10 the eager
+# fallback skips activation quantization and runs a dense float GEMM, which is
+# a different contract than quantized int8_linear. The kernel and the reference
+# share the same quantized operands, so only accumulation order and epilogue
+# rounding may differ.
+_DP4A_AUTO_SHAPES = [
+    (1, 256, 256),  # GEMV
+    (16, 512, 256),  # GEMV upper edge
+    (17, 256, 512),  # GEMM lower edge
+    (16, 16, 32),  # GEMV, K below the GEMM tile
+    (17, 16, 16),  # GEMM, minimal K
+    (65, 67, 80),  # non-tile K, non-tile N
+    (128, 33, 144),  # skinny N
+    (1024, 512, 272),  # large GEMM
+]
+
+
+def _int8_linear_fp32_reference(q, wq, sa, ws, bias):
+    """Exact INT8 math the DP4A path implements: (q @ w^T) * sa * ws + bias."""
+    ref = q.float() @ wq.float().T
+    ref = ref * (sa.reshape(-1, 1) * ws.reshape(1, -1))
+    if bias is not None:
+        ref = ref + bias.reshape(1, -1)
+    return ref
+
+
+@pytest.mark.parametrize(("m", "n", "k"), _DP4A_AUTO_SHAPES)
+@pytest.mark.parametrize("bias", [False, True])
+@needs_rdna2_dp4a
+def test_int8_dp4a_auto_matches_int8_reference(m, n, k, bias):
+    torch.manual_seed(0)
+    x = torch.randn(m, k, device=DEV, dtype=torch.float32) * 0.5
+    w = torch.randn(n, k, device=DEV, dtype=torch.float32) * 0.5
+    wq, ws = ck.quantize_int8_rowwise(w)
+    b = torch.randn(n, device=DEV, dtype=torch.float32) if bias else None
+
+    with ck.use_backend("hip"):
+        q, sa = ck.quantize_int8_rowwise(x)
+        out = ck.int8_linear(x, wq, ws.reshape(-1), b, torch.float32)
+    ref = _int8_linear_fp32_reference(q, wq, sa, ws.reshape(-1), b)
+
+    assert out.shape == (m, n)
+    assert_values_close(
+        out,
+        ref,
+        rtol=1e-3,
+        atol=1e-3,
+        name=f"dp4a_auto_{m}_{n}_{k}",
+        max_mismatch_ratio=0.01,
+    )
+
+
+@pytest.mark.parametrize("out_dtype", [torch.float32, torch.float16, torch.bfloat16])
+@needs_rdna2_dp4a
+def test_int8_dp4a_auto_output_dtypes(out_dtype):
+    torch.manual_seed(2)
+    m, n, k = 65, 67, 80
+    x = torch.randn(m, k, device=DEV, dtype=torch.float32) * 0.5
+    w = torch.randn(n, k, device=DEV, dtype=torch.float32) * 0.5
+    wq, ws = ck.quantize_int8_rowwise(w)
+
+    with ck.use_backend("hip"):
+        q, sa = ck.quantize_int8_rowwise(x)
+        out = ck.int8_linear(x, wq, ws.reshape(-1), None, out_dtype)
+    ref = _int8_linear_fp32_reference(q, wq, sa, ws.reshape(-1), None).to(out_dtype)
+
+    assert out.dtype == out_dtype
+    # INT32 accumulation is exact; fp32 differs from the reference only by
+    # accumulation order. fp16/bf16 add one rounding step at the epilogue.
+    tolerance = 1e-3 if out_dtype == torch.float32 else 1e-2
+    assert_values_close(
+        out,
+        ref,
+        rtol=tolerance,
+        atol=tolerance,
+        name=f"dp4a_auto_{out_dtype}",
+        max_mismatch_ratio=0.01,
+    )
+
+
+@needs_rdna2_dp4a
+def test_int8_dp4a_auto_3d_input_matches_reference():
+    torch.manual_seed(3)
+    x = torch.randn(2, 128, 256, device=DEV, dtype=torch.float32) * 0.5
+    w = torch.randn(512, 256, device=DEV, dtype=torch.float32) * 0.5
+    wq, ws = ck.quantize_int8_rowwise(w)
+
+    with ck.use_backend("hip"):
+        q, sa = ck.quantize_int8_rowwise(x.reshape(-1, x.shape[-1]))
+        out = ck.int8_linear(x, wq, ws.reshape(-1), None, torch.float32)
+    ref = _int8_linear_fp32_reference(q, wq, sa, ws.reshape(-1), None)
+    ref = ref.reshape(2, 128, 512)
+
+    assert out.shape == (2, 128, 512)
+    assert_values_close(
+        out,
+        ref,
+        rtol=1e-2,
+        atol=1e-2,
+        name="dp4a_auto_3d",
+        max_mismatch_ratio=0.01,
+    )
+
+
+@needs_rdna2_dp4a
+def test_int8_dp4a_auto_scalar_weight_scale_matches_reference():
+    torch.manual_seed(4)
+    x = torch.randn(64, 256, device=DEV, dtype=torch.float32) * 0.5
+    w = torch.randn(256, 256, device=DEV, dtype=torch.float32) * 0.5
+    wq, _ = ck.quantize_int8_rowwise(w)
+    scalar = torch.tensor(0.02, device=DEV, dtype=torch.float32)
+
+    with ck.use_backend("hip"):
+        q, sa = ck.quantize_int8_rowwise(x)
+        out = ck.int8_linear(x, wq, scalar, None, torch.float32)
+    ref = _int8_linear_fp32_reference(q, wq, sa, scalar, None)
+
+    assert_values_close(
+        out,
+        ref,
+        rtol=1e-2,
+        atol=1e-2,
+        name="dp4a_auto_scalar_scale",
+        max_mismatch_ratio=0.01,
+    )
+
+
+@needs_rdna2_dp4a
+def test_int8_dp4a_auto_empty_batch_matches_reference():
+    torch.manual_seed(5)
+    x = torch.empty(0, 256, device=DEV, dtype=torch.float32)
+    w = torch.randn(512, 256, device=DEV, dtype=torch.float32) * 0.5
+    wq, ws = ck.quantize_int8_rowwise(w)
+
+    with ck.use_backend("hip"):
+        q, sa = ck.quantize_int8_rowwise(x)
+        out = ck.int8_linear(x, wq, ws.reshape(-1), None, torch.float32)
+    ref = _int8_linear_fp32_reference(q, wq, sa, ws.reshape(-1), None)
+
+    assert out.shape == (0, 512)
+    assert out.numel() == 0
+    assert torch.equal(out, ref)
+
+
+# Covers the extended RDNA2 GEMV range, each WMMA tile path, and sizes that are
+# not multiples of the macro tile.
 GEMM_SHAPES = [
     (1, 256, 256),
     (8, 512, 256),
+    (9, 256, 256),
+    (16, 512, 256),
     (17, 256, 512),
     (128, 512, 256),
     (333, 1152, 1152),
@@ -105,7 +525,6 @@ def test_scaled_mm_fp8_matches_reference(hip, m, n, k, bias):
 
 @pytest.mark.parametrize(("m", "n", "k"), GEMM_SHAPES)
 @pytest.mark.parametrize("per_channel", [False, True])
-@needs_wmma
 def test_int8_linear_matches_eager(m, n, k, per_channel):
     torch.manual_seed(0)
     x = torch.randn(m, k, device=DEV, dtype=torch.bfloat16)
@@ -121,8 +540,10 @@ def test_int8_linear_matches_eager(m, n, k, per_channel):
         ref = ck.int8_linear(x, wq, ws, bias, torch.bfloat16)
 
     assert out.shape == (m, n)
-    # Both paths quantize x per row and differ only in the rounding of the
-    # activation quantizer, so compare with an int8-sized tolerance.
+    # On WMMA targets both paths quantize x per row and differ only in the
+    # rounding of the activation quantizer. On gfx10 the eager side is the
+    # unquantized float fallback, so the 5% tolerance also covers the semantic
+    # gap between a quantized and an unquantized activation.
     scale = ref.float().abs().max().item()
     assert (out.float() - ref.float()).abs().max().item() < 0.05 * scale
 

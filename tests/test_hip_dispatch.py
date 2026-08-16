@@ -144,8 +144,8 @@ def test_hip_wmma_capability(arches, expected):
     assert hip_backend._has_wmma(arches) is expected
 
 
-def test_hip_drops_gemms_without_matrix_cores():
-    """RDNA2 keeps the elementwise kernels and hands the GEMMs back to triton/eager."""
+def test_hip_limits_gemms_without_matrix_cores():
+    """RDNA2 keeps its DP4A INT8 paths and hands WMMA-only GEMMs to other backends."""
     with_wmma = hip_backend._build_constraints(has_wmma=True)
     without = hip_backend._build_constraints(has_wmma=False)
 
@@ -155,6 +155,18 @@ def test_hip_drops_gemms_without_matrix_cores():
     assert not (hip_backend._WMMA_ONLY_OPS & set(without))
     # na3d is a matrix-core kernel: without one it traps rather than answers.
     assert "na3d" in hip_backend._WMMA_ONLY_OPS
+    # int8_linear and convrot_w4a4_linear run on RDNA2 through DP4A paths, so
+    # they stay advertised without matrix cores.
+    assert "int8_linear" in without
+    assert with_wmma["int8_linear"].call_rules == ()
+    assert without["int8_linear"].call_rules == ()
+    assert "convrot_w4a4_linear" in without
+    assert with_wmma["convrot_w4a4_linear"].call_rules == ()
+    assert without["convrot_w4a4_linear"].call_rules == ()
+    # The WMMA-only GEMMs must still be dropped on RDNA2.
+    for wmma_only in ("na3d", "scaled_mm_svdquant_w4a4", "w4a8_int8_linear"):
+        assert wmma_only in hip_backend._WMMA_ONLY_OPS
+        assert wmma_only not in without
     # The elementwise kernels need no matrix cores and must survive.
     for op in ("apply_rope", "apply_rope_", "rms_rope", "rms_rope_split_half1_", "adaln",
                "rms_adaln", "quantize_per_tensor_fp8", "gemv_awq_w4a16",
@@ -164,6 +176,32 @@ def test_hip_drops_gemms_without_matrix_cores():
     # The fused W4A8 requantize is elementwise too: it packs weights and never
     # reaches a matrix core, so RDNA2 must keep it.
     assert "quantize_w4a8_int8_weight" in without
+
+
+@pytest.mark.parametrize(
+    ("arches", "device", "expected"),
+    [
+        (("gfx1030",), torch.device("cuda:0"), 16),
+        (("gfx1030", "gfx1100"), torch.device("cuda:0"), 16),
+        (("gfx1030", "gfx1100"), torch.device("cuda:1"), 8),
+        (("gfx1200",), torch.device("cuda:0"), 8),
+    ],
+)
+def test_int8_gemv_limit_is_device_specific(monkeypatch, arches, device, expected):
+    monkeypatch.setattr(hip_backend, "_visible_gfx_arches", lambda: arches)
+
+    assert hip_backend._int8_gemv_max_m(device) == expected
+
+
+def test_int8_gemv_max_m_is_canonical_threshold(monkeypatch):
+    """The Python threshold is the single source of truth for RDNA2, and the
+    C++ int8_gemm binding accepts any value in [1, 16] it may take."""
+    assert 1 <= hip_backend._INT8_GEMV_MAX_M <= 16
+    monkeypatch.setattr(hip_backend, "_visible_gfx_arches", lambda: ("gfx1030",))
+    assert (
+        hip_backend._int8_gemv_max_m(torch.device("cuda:0"))
+        == hip_backend._INT8_GEMV_MAX_M
+    )
 
 
 def test_hip_advertises_every_inplace_rope_entry():
@@ -347,3 +385,52 @@ def test_combined_wheel_cache_keys_include_hip_sources():
         "ccache-windows-x86_64-cuda13-py${{ matrix.python-version }}-"
     )
     assert workflow.count(versioned_windows_prefix) == 2  # primary key + restore prefix
+
+
+# ---------------------------------------------------------------------------
+# RDNA2 DP4A direct entry validation (CPU-runnable)
+# ---------------------------------------------------------------------------
+
+
+def test_dp4a_direct_entry_rejects_non_rdna2_arch(monkeypatch):
+    """The direct entry must not run on architectures without DP4A."""
+    monkeypatch.setattr(hip_backend, "_gfx_arch", lambda device: "gfx1100")
+    a = torch.zeros(4, 16, dtype=torch.int8)
+    w = torch.zeros(4, 16, dtype=torch.int8)
+    with pytest.raises(RuntimeError, match="validated RDNA2"):
+        hip_backend._int8_gemm_dp4a_direct(a, w, torch.ones(4), torch.ones(4))
+
+
+@pytest.mark.parametrize(
+    ("mutate", "match"),
+    [
+        (lambda a, w: (a.unsqueeze(0), w), "must be 2D int8"),
+        (lambda a, w: (a.float(), w), "must be 2D int8"),
+        (lambda a, w: (a, w[:, :8]), "inner dimensions"),
+        (lambda a, w: (a[:, :8], w[:, :8]), "divisible by 16"),
+    ],
+)
+def test_dp4a_direct_entry_validates_shapes_and_dtypes(monkeypatch, mutate, match):
+    monkeypatch.setattr(hip_backend, "_gfx_arch", lambda device: "gfx1030")
+    a = torch.zeros(4, 16, dtype=torch.int8)
+    w = torch.zeros(4, 16, dtype=torch.int8)
+    with pytest.raises(ValueError, match=match):
+        hip_backend._int8_gemm_dp4a_direct(*mutate(a, w), torch.ones(4), torch.ones(4))
+
+
+def test_dp4a_direct_entry_validates_scales_bias_and_output_dtype(monkeypatch):
+    monkeypatch.setattr(hip_backend, "_gfx_arch", lambda device: "gfx1030")
+    a = torch.zeros(4, 16, dtype=torch.int8)
+    w = torch.zeros(4, 16, dtype=torch.int8)
+    with pytest.raises(ValueError, match="scale_a must have 4"):
+        hip_backend._int8_gemm_dp4a_direct(a, w, torch.ones(3), torch.ones(4))
+    with pytest.raises(ValueError, match="scale_b must have 1 or 4"):
+        hip_backend._int8_gemm_dp4a_direct(a, w, torch.ones(4), torch.ones(3))
+    with pytest.raises(ValueError, match="bias must be 1D of length 4"):
+        hip_backend._int8_gemm_dp4a_direct(
+            a, w, torch.ones(4), torch.ones(4), bias=torch.ones(3)
+        )
+    with pytest.raises(ValueError, match="unsupported output dtype"):
+        hip_backend._int8_gemm_dp4a_direct(
+            a, w, torch.ones(4), torch.ones(4), out_dtype=torch.float64
+        )

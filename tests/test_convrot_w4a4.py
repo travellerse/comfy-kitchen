@@ -7,7 +7,11 @@ import torch.nn.functional as functional
 
 import comfy_kitchen as ck
 from comfy_kitchen.backends import cuda as cuda_backend
-from comfy_kitchen.backends.eager.svdquant import _unpack_int4_row_major
+from comfy_kitchen.backends.eager.svdquant import (
+    _pack_int4_row_major,
+    _unpack_int4_row_major,
+    _unpack_uint4_row_major,
+)
 from comfy_kitchen.tensor import QuantizedTensor
 from comfy_kitchen.tensor.convrot_w4a4 import (
     convrot_w4a4_linear,
@@ -16,6 +20,28 @@ from comfy_kitchen.tensor.convrot_w4a4 import (
 )
 
 from .conftest import cuda_backend_available
+
+
+def test_int4_pack_nibble_position_and_signedness():
+    """The packed byte layout the W4A4 kernels consume: byte j holds columns
+    2j (low nibble) and 2j+1 (high nibble), signed two's complement.
+
+    Roundtrip and linear tests cannot catch a global low/high nibble swap: a
+    consistent adjacent-column permutation leaves dot products unchanged, so
+    this pins the bit positions explicitly. A future RDNA2 v_dot8_i32_i4 kernel
+    consumes exactly this layout, and a nibble-order mistake there would be
+    silent in the roundtrip tests.
+    """
+    values = torch.tensor([[1, -1, 2, -2, 3, 7, 4, -7]], dtype=torch.int32)
+    packed = _pack_int4_row_major(values)
+    assert packed.shape == (1, 4)
+    # byte j = (col 2j & 0xF) | ((col 2j+1 & 0xF) << 4), stored as int8.
+    assert packed.tolist() == [[-15, -30, 115, -108]]
+    # Signed interpretation restores the original values (two's complement:
+    # -1 -> 0xF, -7 -> 0x9).
+    assert torch.equal(_unpack_int4_row_major(packed), values.to(torch.int8))
+    # Unsigned interpretation reads the same bits as [0, 15].
+    assert _unpack_uint4_row_major(packed).tolist() == [[1, 15, 2, 14, 3, 7, 4, 9]]
 
 
 def test_convrot_w4a4_weight_quantize_contract(seed):
