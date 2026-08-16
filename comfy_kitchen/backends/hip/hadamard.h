@@ -29,7 +29,8 @@ inline void check_convrot_group_size(int group_size) {
     }
 }
 
-// The kernel's static LDS: the g[256] and red[256] reductions below.
+// The kernel's static LDS: the double-buffered stagebuf[2][256] butterfly,
+// reused as the row-max reduction.
 constexpr size_t kConvrotStaticLds = 2 * 256 * sizeof(float);
 
 // convrot_quant_kernel stages the whole rotated row in dynamic LDS, preserving
@@ -148,8 +149,7 @@ __global__ __launch_bounds__(256) void convrot_quant_kernel(
     int M, int K, int G) {
 
     const float h4[4][4] = {{1, 1, 1, -1}, {1, 1, -1, 1}, {1, -1, 1, 1}, {-1, 1, 1, 1}};
-    __shared__ float g[256];
-    __shared__ float red[256];
+    __shared__ float stagebuf[2][256];
     extern __shared__ unsigned char rowbuf_raw[];
     RowT* rowbuf = reinterpret_cast<RowT*>(rowbuf_raw);  // K entries: the rotated row
 
@@ -173,22 +173,28 @@ __global__ __launch_bounds__(256) void convrot_quant_kernel(
     for (int gbase = 0; gbase < ngrp; gbase += gpw) {
         const int grp = gbase + glocal;
         const bool active = grp < ngrp;
-        g[t] = active ? load_input_act<ACT>(x, in_row, grp * G + e, K, in_dtype) : 0.0f;
+        stagebuf[0][t] = active
+                             ? load_input_act<ACT>(x, in_row, grp * G + e, K, in_dtype)
+                             : 0.0f;
         __syncthreads();
 
         for (int stage = 0; stage < nstages; ++stage) {
             const int stride = 1 << (2 * stage);
             const int ds = (e / stride) & 3;
             const int b = gbase_idx + (e - ds * stride);
-            const float v0 = g[b], v1 = g[b + stride], v2 = g[b + 2 * stride], v3 = g[b + 3 * stride];
+            const int src = stage & 1;
+            const int dst = src ^ 1;
+            const float v0 = stagebuf[src][b];
+            const float v1 = stagebuf[src][b + stride];
+            const float v2 = stagebuf[src][b + 2 * stride];
+            const float v3 = stagebuf[src][b + 3 * stride];
             const float nv = h4[ds][0] * v0 + h4[ds][1] * v1 + h4[ds][2] * v2 + h4[ds][3] * v3;
-            __syncthreads();
-            g[t] = nv;
+            stagebuf[dst][t] = nv;
             __syncthreads();
         }
 
         if (active) {
-            const float tv = g[t] * norm;
+            const float tv = stagebuf[nstages & 1][t] * norm;
             const RowT stored = store_row_value<RowT>(tv);
             rowbuf[static_cast<int64_t>(grp) * G + e] = stored;
             lmax = fmaxf(lmax, fabsf(load_row_value(stored)));
@@ -196,6 +202,7 @@ __global__ __launch_bounds__(256) void convrot_quant_kernel(
         __syncthreads();
     }
 
+    float* red = stagebuf[0];
     red[t] = lmax;
     __syncthreads();
     for (int s = 128; s > 0; s >>= 1) {
