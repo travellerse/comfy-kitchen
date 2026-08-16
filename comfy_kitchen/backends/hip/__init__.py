@@ -148,9 +148,9 @@ def _visible_gfx_arches() -> tuple[str | None, ...]:
 
 
 # RDNA2 has no matrix cores; RDNA3/3.5 and RDNA4 do. The "no_wmma" group names
-# the targets without matrix cores (RDNA2); they still run the non-WMMA GEMMs
-# such as the AWQ GEMV. This exact manifest is also consumed by setup.py and
-# CMake. Never infer support from a gfx prefix: a new compiler-recognized
+# the targets without matrix cores (RDNA2); it still runs the non-WMMA GEMMs
+# (INT8/W4A4 DP4A, AWQ GEMV). This exact manifest is also consumed by setup.py
+# and CMake. Never infer support from a gfx prefix: a new compiler-recognized
 # target needs its WMMA policy reviewed before it is safe.
 _ARCH_MANIFEST_PATH = os.path.join(os.path.dirname(__file__), "architectures.json")
 _ARCH_GROUPS = json.loads(
@@ -165,12 +165,11 @@ _ARCH_SUPPORTED = _ARCH_NO_WMMA | _ARCH_WMMA
 # These GEMMs need matrix cores. Everything else is elementwise, a scalar
 # reduction, or has a separate non-WMMA path. This set names the
 # registry-dispatched operations that _build_constraints must drop on RDNA2;
-# int8_linear is intentionally absent: RDNA2 runs it through the DP4A
-# GEMV/GEMM paths instead. The fp8 GEMM is reached through scaled_mm_v2's
-# _hip_fp8_gemm, which gates on has_wmma() itself.
+# int8_linear and convrot_w4a4_linear are intentionally absent: RDNA2 runs
+# them through DP4A GEMV/GEMM paths instead. The fp8 GEMM is reached through
+# scaled_mm_v2's _hip_fp8_gemm, which gates on has_wmma() itself.
 _WMMA_ONLY_OPS = frozenset({
     "na3d",
-    "convrot_w4a4_linear",
     "scaled_mm_svdquant_w4a4",
     "w4a8_int8_linear",
 })
@@ -1226,11 +1225,23 @@ def convrot_w4a4_linear(
     qw = _operand(qweight, x.device, "qweight", shape=(n, k // 2))
 
     out = torch.empty((m, n), dtype=x.dtype, device=x.device)
-    _C.convrot_w4a4_gemm(
-        _dl(qact), _dl(qw), _dl(out),
-        _dl(x_scale), _dl(wscales), None if bias is None else _dl(bias),
-        m, n, k, DTYPE_TO_CODE[x.dtype], _stream(x),
-    )
+    if _gfx_arch(x.device) in _ARCH_NO_WMMA:
+        # RDNA2 has no WMMA: run the same packed-int4 contract through the
+        # sdot8 kernel. The quantizer and the per-row scale epilogue are shared
+        # with the WMMA path, so only the GEMM execution differs.
+        _C.w4a4_gemm_dp4a(
+            _dl(qact), _dl(qw), _dl(out),
+            _dl(x_scale), _dl(wscales), 1,
+            None if bias is None else _dl(bias),
+            m, n, k, DTYPE_TO_CODE[x.dtype], _stream(x),
+        )
+    else:
+        _C.convrot_w4a4_gemm(
+            _dl(qact), _dl(qw), _dl(out),
+            _dl(x_scale), _dl(wscales),
+            None if bias is None else _dl(bias),
+            m, n, k, DTYPE_TO_CODE[x.dtype], _stream(x),
+        )
     return out.reshape(*orig_shape[:-1], n)
 
 
@@ -2085,7 +2096,8 @@ def _build_constraints(has_wmma: bool = True) -> dict:
 
     if not has_wmma:
         # RDNA2: WMMA kernels are compiled but trap, so they must not be advertised.
-        # INT8 uses the DP4A GEMV/GEMM; the WMMA-only GEMMs route to triton/eager.
+        # INT8 and W4A4 use DP4A GEMV/GEMM; the WMMA-only GEMMs route to
+        # triton/eager.
         constraints = {k: v for k, v in constraints.items() if k not in _WMMA_ONLY_OPS}
 
     return constraints

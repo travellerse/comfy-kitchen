@@ -385,6 +385,42 @@ void int8_gemm_dp4a(nb::ndarray<> a, nb::ndarray<> b, nb::ndarray<> c,
     check_hip_launch();
 }
 
+void w4a4_gemm_dp4a(nb::ndarray<> a, nb::ndarray<> b, nb::ndarray<> c,
+                   nb::ndarray<> scale_a, nb::ndarray<> scale_b, int scale_b_stride,
+                   OptArray bias, int M, int N, int K, int out_code, uintptr_t stream_ptr) {
+    constexpr const char* kFn = "w4a4_gemm_dp4a";
+    if (scale_b_stride != 0 && scale_b_stride != 1) {
+        throw std::runtime_error(std::string(kFn) + ": scale_b_stride must be 0 or 1");
+    }
+    if ((reinterpret_cast<uintptr_t>(a.data()) % 16) != 0 ||
+        (reinterpret_cast<uintptr_t>(b.data()) % 16) != 0) {
+        throw std::runtime_error(std::string(kFn) + ": operands must be 16-byte aligned");
+    }
+    require_nonneg(M, kFn, "M");
+    require_nonneg(N, kFn, "N");
+    require_nonneg(K, kFn, "K");
+    // int4 packs two nibbles per byte, so the packed rows are K / 2 bytes wide.
+    // The launcher additionally requires K % 32 == 0 for 16-byte chunk staging.
+    require_dtype(a, 4, 4, kFn, "a");
+    require_dtype(b, 4, 4, kFn, "b");
+    require_dtype(c, 0, 2, kFn, "c");
+    require_out_matches(c, out_code, kFn);
+    require_len(a, static_cast<int64_t>(M) * (K / 2), kFn, "a");
+    require_len(b, static_cast<int64_t>(N) * (K / 2), kFn, "b");
+    require_len(c, static_cast<int64_t>(M) * N, kFn, "c");
+    require_scale_len(scale_a, static_cast<size_t>(M), kFn, "scale_a");
+    require_scale_len(scale_b, scale_b_stride == 1 ? static_cast<size_t>(N) : 1,
+                      kFn, "scale_b");
+    require_bias(bias, N, kFn);
+
+    launch_w4a4_gemm_dp4a_kernel(
+        a.data(), b.data(), c.data(), scale_a.data(), scale_b.data(), scale_b_stride,
+        opt_data(bias), opt_code(bias), M, N, K, out_code,
+        reinterpret_cast<hipStream_t>(stream_ptr));
+    check_hip_launch();
+}
+
+
 void convrot_w4a4_gemm(nb::ndarray<> a, nb::ndarray<> b, nb::ndarray<> c, nb::ndarray<> x_scale,
                        nb::ndarray<> w_scale, OptArray bias, int M, int N, int K, int out_code,
                        uintptr_t stream_ptr) {
@@ -1402,6 +1438,7 @@ NB_MODULE(_C, m) {
     m.def("scaled_mm_fp8", &scaled_mm_fp8);
     m.def("int8_gemm", &int8_gemm);
     m.def("int8_gemm_dp4a", &int8_gemm_dp4a);
+    m.def("w4a4_gemm_dp4a", &w4a4_gemm_dp4a);
     m.def("convrot_w4a4_gemm", &convrot_w4a4_gemm);
     m.def("quantize_int8_rowwise", &quantize_int8_rowwise);
     m.def("quantize_int8_convrot", &quantize_int8_convrot);
